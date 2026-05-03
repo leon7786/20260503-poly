@@ -23,9 +23,9 @@ def test_config_can_limit_to_btc_and_set_paper_bankroll(tmp_path):
     assert trader.paper.cash == 30.0
 
 
-def test_paper_buy_spends_up_to_configured_stake_and_records_position(tmp_path):
+def test_paper_buy_uses_five_shares_within_350_budget_and_records_position(tmp_path):
     m = load_mod()
-    cfg = m.StrategyConfig(log_path=tmp_path / "events.jsonl", coins=["btc"], paper_bankroll=30.0, paper_trade_notional=30.0, entry_price_cap=0.65)
+    cfg = m.StrategyConfig(log_path=tmp_path / "events.jsonl", coins=["btc"], paper_bankroll=30.0, paper_trade_notional=3.5, entry_shares=5.0, entry_price_cap=0.65)
     trader = m.V1Trader(cfg)
     result = trader.paper.record_buy(
         coin="btc",
@@ -33,14 +33,16 @@ def test_paper_buy_spends_up_to_configured_stake_and_records_position(tmp_path):
         direction="UP",
         token_id="up-token",
         price=0.65,
-        max_notional=30.0,
+        max_notional=3.5,
+        requested_shares=5.0,
         round_start=1800,
         ts=2692.0,
         meta={"reason": "ok"},
     )
     assert result["paper_status"] == "filled"
-    assert result["shares"] == 30.0 / 0.65
-    assert trader.paper.cash == 0.0
+    assert result["shares"] == 5.0
+    assert result["spent"] == 3.25
+    assert trader.paper.cash == 26.75
     assert trader.paper.positions[0].direction == "UP"
 
 

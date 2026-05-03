@@ -199,13 +199,17 @@ class PaperLedger:
         self.positions: list[PaperPosition] = []
         self.trades: list[dict[str, Any]] = []
 
-    def record_buy(self, *, coin: str, source: str, direction: str, token_id: str, price: float, max_notional: float, round_start: int, ts: float, meta: dict[str, Any]) -> dict[str, Any]:
+    def record_buy(self, *, coin: str, source: str, direction: str, token_id: str, price: float, max_notional: float, requested_shares: float, round_start: int, ts: float, meta: dict[str, Any]) -> dict[str, Any]:
         if price <= 0 or max_notional <= 0 or self.cash <= 0:
             out = {"paper_status": "rejected", "reason": "invalid_price_or_no_cash"}
             self.trades.append({"ts": ts, "action": "buy_reject", **out, **meta})
             return out
-        spend = min(float(max_notional), self.cash)
-        shares = spend / price
+        shares = float(requested_shares)
+        spend = price * shares
+        if spend > max_notional or spend > self.cash:
+            out = {"paper_status": "rejected", "reason": "budget_exceeded", "needed": spend, "max_notional": max_notional, "cash": self.cash}
+            self.trades.append({"ts": ts, "action": "buy_reject", **out, **meta})
+            return out
         pos = PaperPosition(coin=coin, source=source, direction=direction, token_id=token_id, shares=shares, avg_price=price, cost=spend, round_start=round_start, opened_at=ts, meta=meta)
         self.positions.append(pos)
         self.cash = round(self.cash - spend, 10)
@@ -493,7 +497,7 @@ class V1Trader:
         token = st.tokens[direction]
         resp = await self.executor.buy(token_id=token, price=self.cfg.entry_price_cap, shares=self.cfg.entry_shares, meta=event)
         if not self.cfg.live_trading:
-            paper = self.paper.record_buy(coin=coin, source=source, direction=direction, token_id=token, price=self.cfg.entry_price_cap, max_notional=self.cfg.paper_trade_notional, round_start=st.current_round, ts=now_ts, meta=event)
+            paper = self.paper.record_buy(coin=coin, source=source, direction=direction, token_id=token, price=self.cfg.entry_price_cap, max_notional=self.cfg.paper_trade_notional, requested_shares=self.cfg.entry_shares, round_start=st.current_round, ts=now_ts, meta=event)
             self.logger.write({"event": "paper_buy", **event, **paper})
         filled = float(resp.get("filled_shares") or 0.0)
         if filled > 0:
