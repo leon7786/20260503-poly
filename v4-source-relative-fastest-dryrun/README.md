@@ -1,89 +1,121 @@
-# 20260503-poly v4 — Polymarket 15m Up/Down Dry-Run Trader
+# 20260503-poly v4 — Polymarket 15 分钟 Up/Down Dry-Run 交易器
 
-> **Status:** v4 dry-run first. Live trading is intentionally disabled by default.
+> **状态：** v4 默认只做 dry-run。真实交易默认关闭。
 >
-> Repository: <https://github.com/leon7786/20260503-poly>
+> 仓库：<https://github.com/leon7786/20260503-poly>
 
-## 1. What v4 does
+## 1. v4 做什么
 
-v4 is a Polymarket 15-minute crypto **Up/Down** strategy runner focused on the final seconds of each round.
+v4 是一个针对 Polymarket 加密货币 15 分钟 **Up/Down** 市场的策略运行器，重点监控每轮最后几秒。
 
-The core idea is:
+核心思路：
 
-1. Find the current Polymarket 15m market tokens by slug, e.g. `btc-updown-15m-<round_start>`.
-2. For each quote source, lock that source's own price at the round timestamp as `source_open`.
-3. During the final 10 seconds, monitor several fast exchange feeds at the same time.
-4. If any source crosses its own `source_open`, the fastest valid cross wins.
-5. Immediately submit a protected Polymarket order in dry-run mode:
-   - side: `UP` or `DOWN`
-   - size: 5 shares
-   - max price: 0.65
-   - order type: `FAK` by default
+1. 根据 slug 自动找到当前 Polymarket 15m 市场 token，例如 `btc-updown-15m-<round_start>`。
+2. 每个报价源在本轮开始时，用自己的第一笔有效价格锁定 `source_open`。
+3. 最后 10 秒，同时监控多个交易所的最快报价源。
+4. 任意一个 source 穿越自己的 `source_open`，即认为 fastest valid cross 出现。
+5. 立即生成 Polymarket 受保护订单意图，当前默认 dry-run：
+   - 方向：`UP` 或 `DOWN`
+   - 数量：5 shares
+   - 最高价格：0.65
+   - 订单类型：默认 `FAK`
 
-This version is designed to test the production wiring safely before live trading.
+v4 的目标是：在真实交易前，先安全验证多源行情、时间戳开盘价、final-window cross、下单路径和日志完整性。
 
-## 2. Why source-relative open is used
+## 2. 为什么使用 source-relative open
 
-Polymarket BTC/USD rounds resolve from Chainlink BTC/USD, not directly from Binance, Coinbase, OKX, or Bybit.
+Polymarket BTC/USD round 的结算来源是 Chainlink BTC/USD，不是直接使用 Binance、Coinbase、OKX 或 Bybit 的现货价格。
 
-A naive trigger like this is unsafe:
-
-```text
-Binance current price > Polymarket / Chainlink open
-```
-
-Different venues naturally have basis differences. Instead, v4 uses timestamp-aligned source opens:
+直接这样判断是不安全的：
 
 ```text
-Binance current price  vs Binance round open
-Coinbase current price vs Coinbase round open
-Bybit mid price        vs Bybit round open
-OKX mid price          vs OKX round open
+Binance 当前价 > Polymarket / Chainlink open
 ```
 
-Mathematically, this is equivalent to mapping each exchange's open to the Polymarket round open by timestamp. It avoids false signals caused by venue basis.
+原因是不同交易所之间天然存在 basis / 价差。比如同一时间：
 
-## 3. Quote sources
+```text
+Chainlink BTC/USD open = 101000.0
+Binance BTCUSDT        = 100996.5
+Coinbase BTC-USD       = 101002.1
+Bybit BTCUSDT mid      = 100998.8
+OKX BTC-USDT mid       = 100997.9
+```
 
-v4 currently monitors these feeds concurrently:
+如果拿交易所的 absolute price 去穿越 Chainlink open，很容易被交易所 basis 误导。
 
-| Source name | Exchange feed | Price used | Purpose |
+v4 改用 timestamp 对齐的 source open：
+
+```text
+Binance 当前价  vs Binance 本轮 open
+Coinbase 当前价 vs Coinbase 本轮 open
+Bybit mid 当前价 vs Bybit 本轮 open
+OKX mid 当前价   vs OKX 本轮 open
+```
+
+这等价于把每个交易所的开盘价映射到 Polymarket round 的同一个时间戳上。触发信号只看：
+
+```text
+source_now 是否穿越 source_open
+```
+
+这样更接近“用最快交易所报价预测 Chainlink 最终方向”的真实意图。
+
+## 3. 当前监控的最快报价源
+
+v4 同时监控这些 WebSocket feed：
+
+| Source 名称 | 交易所 feed | 使用价格 | 用途 |
 |---|---|---:|---|
-| `binance_trade` | Binance Spot `@trade` | last trade price | fast trade prints |
-| `coinbase_market_trades` | Coinbase Advanced Trade `market_trades` | last trade price | high-frequency USD trade prints |
-| `bybit_orderbook1_mid` | Bybit Spot `orderbook.1` | `(best_bid + best_ask) / 2` | app-like fast level-1 quote |
-| `okx_books5_mid` | OKX Spot `books5` | `(best_bid + best_ask) / 2` | app-like fast book quote |
+| `binance_trade` | Binance Spot `@trade` | 最新成交价 | 原始逐笔成交，反应快 |
+| `coinbase_market_trades` | Coinbase Advanced Trade `market_trades` | 最新成交价 | 高频 USD 成交流 |
+| `bybit_orderbook1_mid` | Bybit Spot `orderbook.1` | `(best_bid + best_ask) / 2` | 类似手机 App 交易页快速跳动的 level-1 报价 |
+| `okx_books5_mid` | OKX Spot `books5` | `(best_bid + best_ask) / 2` | OKX 五档订单簿 mid，通常比 OKX trades 更密 |
 
-The strategy does **not** wait for consensus. The first valid final-window cross triggers the dry-run order attempt.
+策略**不等待多交易所确认**。谁先在 final window 内有效穿越自己的 open，谁触发 dry-run 下单意图。
 
-## 4. Files
+## 4. 文件结构
 
 ```text
-src/poly_v1_trader.py              Main dry-run/live-capable service
-tests/test_v1_trader.py            Unit tests for source-relative opens and execution rules
-scripts/poly_v1_health_check.py    Import/config/public API health check
-deploy/poly-v1-trader.env.example  Safe environment template, LIVE_TRADING=0
-deploy/poly-v1-trader.service      systemd service template
-requirements.txt                   Python dependencies
+src/poly_v1_trader.py              主程序，支持 dry-run / live-capable 执行路径
+tests/test_v1_trader.py            单元测试，覆盖 source-relative open 和执行规则
+scripts/poly_v1_health_check.py    导入、配置、公共 API 健康检查
+deploy/poly-v1-trader.env.example  安全环境变量模板，默认 LIVE_TRADING=0
+deploy/poly-v1-trader.service      systemd 服务模板
+requirements.txt                   Python 依赖
 ```
 
-## 5. Safety model
+## 5. 安全模型
 
-### Live trading is disabled by default
+### 默认关闭真实交易
 
-The default env file contains:
+默认配置里是：
 
 ```text
 LIVE_TRADING=0
 ```
 
-With `LIVE_TRADING=0`, the service logs `dry_run_buy` / `dry_run_sell` events and does not submit real orders.
+当 `LIVE_TRADING=0` 时，服务只写入：
 
-### Explicit live confirmation required
+```text
+dry_run_buy
+dry_run_sell
+```
 
-Do not set `LIVE_TRADING=1` until the dry-run logs have been reviewed and wallet/funder/signature settings are confirmed.
+不会提交真实 Polymarket 订单。
 
-Required for live mode:
+### 开启 live 必须显式确认
+
+不要直接把 `LIVE_TRADING` 改成 1。必须先确认：
+
+- dry-run 日志正常；
+- source open 锁定时间合理；
+- final-window cross 逻辑符合预期；
+- 钱包、funder、signature_type 正确；
+- Polymarket 余额和 allowance 正常；
+- 已明确接受真实交易风险。
+
+live mode 需要：
 
 ```text
 POLY_PRIVATE_KEY=0x...
@@ -92,32 +124,32 @@ POLY_SIGNATURE_TYPE=1
 LIVE_TRADING=1
 ```
 
-### Source-open freshness guard
+### source_open 新鲜度保护
 
-The strategy records when each source open was locked:
+配置：
 
 ```text
 SOURCE_OPEN_MAX_DELAY_SEC=5
 ```
 
-If a source's round open is locked too late, entry is skipped with:
+如果某个 source 是 round 开始很久之后才锁到 open，entry 会跳过：
 
 ```text
 source_open_too_late
 ```
 
-This prevents a service restart mid-round from creating a wrong open anchor.
+这个保护用于避免服务在一轮中途启动时，把错误价格当成本轮开盘价。
 
-## 6. Configuration
+## 6. 配置
 
-Copy the example environment file:
+复制环境变量模板：
 
 ```bash
 sudo cp deploy/poly-v1-trader.env.example /etc/poly-v1-trader.env
 sudo chmod 600 /etc/poly-v1-trader.env
 ```
 
-Important settings:
+重要参数：
 
 ```text
 LIVE_TRADING=0
@@ -138,35 +170,53 @@ POLY_TICK_SIZE=0.01
 POLY_NEG_RISK=0
 ```
 
-## 7. Install
+参数说明：
+
+| 参数 | 含义 |
+|---|---|
+| `ENTRY_WINDOW_SEC=10` | 只在最后 10 秒允许 entry |
+| `NO_ENTRY_AFTER_SEC=0.25` | 距离结束小于 0.25 秒不再 entry，避免太晚 |
+| `ENTRY_PRICE_CAP=0.65` | 买入最高保护价 |
+| `ENTRY_SHARES=5` | 默认买 5 shares |
+| `ENTRY_ORDER_TYPE=FAK` | 默认 Fill-And-Kill，允许部分成交并取消剩余 |
+| `POST_FILL_COOLDOWN_SEC=2` | 成交后 2 秒冷却，不马上反手或止损 |
+| `FAILED_ATTEMPT_COOLDOWN_SEC=0.2` | 失败尝试冷却，避免 tick 级别刷单 |
+| `DRY_RUN_FILL_MODE=no_fill` | dry-run 默认不假设成交 |
+| `SOURCE_OPEN_MAX_DELAY_SEC=5` | source open 迟到超过 5 秒则不使用该 source entry |
+
+## 7. 安装
+
+在 v4 目录里安装：
 
 ```bash
-cd /root/projects/20260503-poly
+cd /root/projects/20260503-poly/v4-source-relative-fastest-dryrun
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-## 8. Test and smoke check
+如果使用仓库根目录已有 `.venv`，也可以直接用根目录 venv 运行。
 
-Run unit tests:
+## 8. 测试和健康检查
+
+运行单元测试：
 
 ```bash
 .venv/bin/pytest tests/test_v1_trader.py -q
 ```
 
-Run syntax checks:
+语法检查：
 
 ```bash
 .venv/bin/python -m py_compile src/poly_v1_trader.py scripts/poly_v1_health_check.py
 ```
 
-Run public API health check:
+公共 API 健康检查：
 
 ```bash
 .venv/bin/python scripts/poly_v1_health_check.py
 ```
 
-Expected health output includes:
+期望输出包含：
 
 ```text
 clob_ok: OK
@@ -174,35 +224,35 @@ gamma_sample_len: 1
 live_trading: false
 ```
 
-## 9. Run dry-run manually
+## 9. 手动 dry-run
 
 ```bash
-cd /root/projects/20260503-poly
+cd /root/projects/20260503-poly/v4-source-relative-fastest-dryrun
 LIVE_TRADING=0 timeout 30s .venv/bin/python src/poly_v1_trader.py
 ```
 
-Then inspect logs:
+查看日志：
 
 ```bash
 tail -n 100 logs/v1_live_trader_events.jsonl
 ```
 
-Useful event types:
+常见事件：
 
-| Event | Meaning |
+| Event | 含义 |
 |---|---|
-| `service_started` | service booted and config logged |
-| `wss_connected` | a quote WebSocket source connected |
-| `round_reset` | new 15m round detected |
-| `open_set` | audit/fallback open set from first source tick |
-| `source_open_locked` | a source's timestamp-aligned round open locked |
-| `source_tick` | quote update processed |
-| `cross` | source crossed its own open |
-| `dry_run_buy` | would submit Polymarket buy order |
-| `entry_no_fill` | dry-run/live order did not fill |
-| `dry_run_sell` | would submit stop/reverse sell |
+| `service_started` | 服务启动并记录配置 |
+| `wss_connected` | 某个交易所行情 WebSocket 已连接 |
+| `round_reset` | 检测到新的 15m round |
+| `open_set` | audit/fallback open，从第一笔 source tick 设置 |
+| `source_open_locked` | 某个 source 的 timestamp-aligned round open 已锁定 |
+| `source_tick` | 处理了一笔报价更新 |
+| `cross` | 某个 source 穿越自己的 source_open |
+| `dry_run_buy` | 如果 live 会提交 Polymarket buy，此处只记录意图 |
+| `entry_no_fill` | dry-run/live 订单没有成交 |
+| `dry_run_sell` | 如果 live 会提交 Polymarket sell，此处只记录意图 |
 
-Example `source_open_locked`:
+`source_open_locked` 示例：
 
 ```json
 {
@@ -215,7 +265,7 @@ Example `source_open_locked`:
 }
 ```
 
-Example final-window cross:
+final-window cross 示例：
 
 ```json
 {
@@ -231,9 +281,9 @@ Example final-window cross:
 }
 ```
 
-## 10. systemd dry-run deployment
+## 10. systemd dry-run 部署
 
-Install the service file:
+安装服务文件：
 
 ```bash
 sudo cp deploy/poly-v1-trader.service /etc/systemd/system/poly-v1-trader.service
@@ -241,27 +291,29 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now poly-v1-trader.service
 ```
 
-Check status:
+查看状态：
 
 ```bash
 systemctl status poly-v1-trader.service --no-pager
 ```
 
-Inspect logs:
+查看策略日志：
 
 ```bash
 tail -f /root/projects/20260503-poly/logs/v1_live_trader_events.jsonl
 ```
 
-Stop service:
+停止服务：
 
 ```bash
 sudo systemctl stop poly-v1-trader.service
 ```
 
-## 11. Execution details
+> 注意：当前 systemd 模板的路径仍按服务器项目路径写死。如果你把 v4 放在其他路径，需要同步修改 `WorkingDirectory`、`ExecStart` 和日志路径。
 
-When live mode is enabled, the executor uses official `py-clob-client` with:
+## 11. 下单实现细节
+
+live mode 开启后，执行器使用官方 `py-clob-client`：
 
 ```python
 OrderArgs(token_id=token_id, price=cap, size=shares, side=BUY)
@@ -269,11 +321,15 @@ client.create_order(order_args, PartialCreateOrderOptions(...))
 client.post_order(signed, OrderType.FAK)
 ```
 
-Important: v4 intentionally uses `OrderArgs`, not `MarketOrderArgs`, because `MarketOrderArgs` BUY uses dollar amount and can trigger extra REST orderbook calculation if price is not set.
+v4 故意使用 `OrderArgs`，不用 `MarketOrderArgs`。原因：
 
-## 12. Current tested status
+- `MarketOrderArgs` 的 BUY `amount` 是美元金额，不是 shares；
+- 如果 `price <= 0`，它可能会额外调用 REST orderbook 计算价格，增加延迟；
+- v4 的目标是：已经有明确 price cap 和 shares，直接构造受保护的 FAK/FOK order。
 
-At the time this v4 README was written, local verification passed:
+## 12. 当前验证状态
+
+写入 v4 README 时，本地验证通过：
 
 ```text
 pytest: 7 passed
@@ -282,25 +338,31 @@ health_check: CLOB OK, Gamma OK
 short dry-run: Binance, Coinbase, Bybit, OKX connected
 ```
 
-A short dry-run produced source ticks and source-open locks across all connected sources.
+短时间 dry-run 已确认会产生：
 
-## 13. Important limitations
+```text
+wss_connected
+source_open_locked
+source_tick
+cross
+```
 
-- Dry-run fills default to `no_fill`; it tests signal and submit intent, not actual Polymarket fill quality.
-- The audit `open_price` is still the first seen source tick. The live trigger uses `source_open`, not this audit open.
-- Chainlink official open/close should still be logged later for post-trade evaluation and source-quality analysis.
-- Live trading requires wallet, funder, signature type, allowance/balance checks, and explicit confirmation.
-- Geographic and Polymarket trading restrictions may apply.
+## 13. 重要限制
 
-## 14. Version notes
+- dry-run 默认 `DRY_RUN_FILL_MODE=no_fill`，只验证信号和下单意图，不代表真实成交质量。
+- `open_price` 目前是 audit/fallback 字段；实际触发使用的是每个 source 自己的 `source_open`。
+- Chainlink official open/close 后续仍应接入日志，用于复盘哪个 source 更贴近最终结算。
+- live trading 需要确认钱包、funder、signature_type、余额、allowance 和地理/合规限制。
+- final 10s aggressive 策略可能高频触发，必须依赖 cooldown 和 order cap 防止过度交易。
 
-v4 differs from earlier versions by adding:
+## 14. v4 相比旧版本新增内容
 
-- source-relative open locking
-- multi-source fastest quote monitoring
-- Coinbase `market_trades`
-- Binance `@trade`
-- Bybit `orderbook.1` mid
-- OKX `books5` mid
-- dry-run-safe deployment defaults
-- tests for source-relative crossing behavior
+- timestamp/source-relative open 锁定；
+- 多交易所 fastest quote monitoring；
+- Coinbase `market_trades`；
+- Binance `@trade`；
+- Bybit `orderbook.1` mid；
+- OKX `books5` mid；
+- dry-run 安全默认配置；
+- source_open 迟到保护；
+- 覆盖 source-relative cross 的单元测试。
