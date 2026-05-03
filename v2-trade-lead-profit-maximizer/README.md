@@ -1,53 +1,49 @@
-# v2 — Trade Lead Profit Maximizer
+# v2 — Trade Lead 利润最大化策略
 
-## One-line thesis
+## 一句话核心
 
-Use **trade-level CEX prints** (`@trade`, not slow ticker summaries) as the earliest public signal, then send **price-protected immediate Polymarket orders** before the CLOB fully reprices.
+使用 **CEX 原始成交流**（Binance `@trade`，不是慢速 ticker 摘要）作为最早公开信号，在 Polymarket CLOB 完全重定价之前，发送 **带价格保护的即时订单** 捕捉价差。
 
 ```text
-CEX @trade prints reveal the real crossing first
-→ infer near-final direction before Polymarket fully reprices
-→ send protected FOK/FAK order immediately
-→ maximize captured edge with adaptive entry price, cooldown, and smart exit
+CEX @trade 成交流最早暴露真实穿越
+→ 在 Polymarket 完全重定价前判断近端方向
+→ 立即发送受保护 FOK/FAK 订单
+→ 用动态价格 cap、冷却、止损和止盈最大化利润
 ```
 
-v2 intentionally ignores old assumptions and starts from one core idea:
+v2 从一个核心出发：
 
-> The edge is not prediction over minutes. The edge is micro-latency: CEX trade prints may lead Polymarket repricing.
+> 这里的 edge 不是分钟级预测，而是微延迟：CEX 成交流可能领先 Polymarket 重新定价。
 
----
+## v2 相比 v1 的变化
 
-## What v2 changes from v1
-
-v1 was clean and conservative:
+v1 是清晰保守版：
 
 ```text
-Binance aggTrade crosses open
+Binance aggTrade 穿越 open
 → FOK/FAK BUY 5 shares @ 0.65
 → 2s cooldown
-→ then evaluate stop
+→ 再检查止损
 ```
 
-v2 upgrades the core engine:
+v2 升级为：
 
-1. Use **Binance `@trade`** as primary trigger, not `@aggTrade`.
-2. Add **microburst confirmation** instead of a single cross.
-3. Use **adaptive price ladder** instead of fixed 0.65 only.
-4. Separate **entry capture** from **profit maximization**.
-5. Use **post-fill edge scoring** to decide hold / exit / hedge.
-6. Log every attempt as an execution experiment, not only as a trade.
+1. 使用 **Binance `@trade`** 作为主触发源，而不是 `@aggTrade`。
+2. 加入 **微爆发确认**，不依赖单一穿越。
+3. 使用 **动态价格 cap 梯度**，不只固定 0.65。
+4. 把 **捕捉入场** 和 **利润最大化** 分开设计。
+5. 成交后根据 edge 评分决定持有、止损、止盈或减仓。
+6. 记录完整延迟漏斗，而不是只记录交易结果。
 
----
+## 数据源
 
-## Data sources
-
-### Primary fast source
+### 主快速数据源
 
 ```text
 Binance symbol@trade
 ```
 
-Raw trade stream emits individual trades with:
+原始成交流字段示例：
 
 ```json
 {
@@ -62,45 +58,41 @@ Raw trade stream emits individual trades with:
 }
 ```
 
-Use:
+使用字段：
 
-- `p` = trade price
-- `q` = trade size
-- `T` = exchange trade timestamp
-- local receive timestamp = network latency measurement
+- `p`：成交价格；
+- `q`：成交数量；
+- `T`：交易所成交时间戳；
+- 本地接收时间戳：用于测量网络延迟。
 
-### Secondary confirmation sources
+### 辅助确认源
 
-Use latest in-memory values only; never wait for them in the hot path unless the signal is weak.
+辅助源只用内存里的最新值，热路径中不等待它们，除非信号较弱。
 
 ```text
 OKX trades/ticker latest
 Bybit trades/ticker latest
-Polymarket WSS book cache for diagnostics and optional gate
+Polymarket WSS book cache 仅用于诊断和可选 gate
 ```
 
----
-
-## Core strategy flow
+## 核心流程
 
 ```text
-1. Maintain current 15m round open price.
-2. Subscribe to Binance @trade for selected coins.
-3. In final window, process every trade print.
-4. Detect open-cross microburst.
-5. Compute signal score within <1ms local CPU time.
-6. If score passes threshold, send protected Polymarket immediate order.
-7. If filled, enter cooldown + position management.
-8. After cooldown, decide hold / stop / take-profit / hedge.
+1. 维护当前 15m round open 价格。
+2. 订阅 Binance @trade。
+3. final window 内处理每一笔成交。
+4. 检测 open-cross 微爆发。
+5. 在本地 CPU <1ms 内计算 signal score。
+6. 分数达标后，立即发送 Polymarket 受保护即时订单。
+7. 如果成交，进入 cooldown + position management。
+8. 冷却后决定 hold / stop / take profit / hedge。
 ```
 
----
+## 信号：trade-cross 微爆发
 
-## Signal: trade-cross microburst
+单一成交穿越 open 噪音太大。v2 使用极短滚动窗口，例如 100ms 到 300ms。
 
-A single trade crossing open is too noisy. v2 uses a tiny rolling window, e.g. 100ms to 300ms.
-
-### Rolling fields per coin
+### 每个币维护的滚动字段
 
 ```text
 last_trade_price
@@ -116,231 +108,220 @@ cross_count_300ms
 last_cross_ts
 ```
 
-### Direction definition
+### 方向定义
 
 ```text
 price > open + epsilon => UP
 price < open - epsilon => DOWN
-otherwise FLAT
+否则 FLAT
 ```
 
-`epsilon` prevents dust-level fake crosses.
+`epsilon` 用于过滤极小噪音穿越。
 
-Suggested first values:
+第一版建议：
 
 ```text
-BTC epsilon: 0.5 to 1.0 USD
-ETH epsilon: 0.03 to 0.10 USD
-SOL epsilon: 0.005 to 0.02 USD
-DOGE/XRP: use percentage epsilon
+BTC epsilon: 0.5 到 1.0 USD
+ETH epsilon: 0.03 到 0.10 USD
+SOL epsilon: 0.005 到 0.02 USD
+DOGE/XRP: 使用百分比 epsilon
 ```
 
----
+## 入场评分
 
-## Entry score
+v2 不只问：是否穿越？
 
-v2 should not simply ask: “did it cross?”
+v2 问：
 
-It should ask:
+> 这次穿越是否足够强，值得立即发送 FOK/FAK？
 
-> Is this cross strong enough to justify an immediate FOK/FAK attempt?
-
-Suggested score:
+建议评分：
 
 ```text
-score = direction_strength
-      + microburst_volume_score
-      + time_left_score
-      + source_agreement_score
-      - chop_penalty
-      - stale_market_penalty
+score = 方向强度
+      + 微爆发成交量分数
+      + 剩余时间分数
+      + 辅助源同向分数
+      - 震荡惩罚
+      - stale market 惩罚
 ```
 
-### Components
+### 评分组成
 
-#### 1. Direction strength
+#### 1. 方向强度
 
 ```text
 abs(last_trade_price - open) / open
 ```
 
-Bigger cross = stronger.
+穿越越深，信号越强。
 
-#### 2. Microburst volume score
-
-```text
-same-side trade volume in last 100ms / recent baseline volume
-```
-
-Rationale: a real move usually has burst volume; a fake cross may be one tiny print.
-
-#### 3. Time-left score
-
-Most valuable window is late but not too late:
+#### 2. 微爆发成交量分数
 
 ```text
-final 10s to 3s: good
-final 3s to 0.5s: high potential but dangerous
-<0.5s: order latency risk high
+最近 100ms 同方向成交量 / 近期基准成交量
 ```
 
-#### 4. Source agreement score
+真实突破通常带成交量；假穿越可能只是一笔很小的成交。
 
-Do not wait, but reward if other sources already agree:
+#### 3. 剩余时间分数
 
 ```text
-OKX latest same side: +small
-Bybit latest same side: +small
-Both disagree: penalty
+final 10s 到 3s：较好
+final 3s 到 0.5s：潜在收益高，但订单延迟风险高
+<0.5s：除非延迟已被证明足够低，否则避免新开仓
 ```
 
-#### 5. Chop penalty
+#### 4. 辅助源同向分数
 
-If side flipped too many times in 300ms to 1s, reduce or block entry.
+不等待辅助源，但如果它们已经同向，给加分：
 
 ```text
-if cross_count_300ms >= 3:
-    block or require stronger volume
+OKX latest 同向：小幅加分
+Bybit latest 同向：小幅加分
+两者都反向：扣分
 ```
 
----
+#### 5. 震荡惩罚
 
-## Entry order design
-
-v2 uses price-protected immediate orders. It does **not** REST-fetch orderbook in the hot path.
-
-### Base order
+如果短时间来回穿越太多，降低分数或禁止入场。
 
 ```text
-side: BUY target outcome
-size: 5 shares minimum
-order type: FOK preferred for clean tests
-limit price: adaptive cap
+如果 cross_count_300ms >= 3：
+    禁止入场，或要求更高成交量
 ```
 
-### Adaptive cap ladder
+## 入场订单设计
 
-Instead of always using `0.65`, v2 tries to maximize profit without destroying expectancy.
+v2 使用受价格保护的即时订单。热路径中不 REST 获取 orderbook。
 
-Suggested ladder by signal strength:
+### 基础订单
 
 ```text
-Weak valid signal:    cap 0.60
-Normal signal:        cap 0.65
-Strong microburst:    cap 0.70
-Very strong late move: cap 0.75
+方向：BUY 目标 outcome
+数量：至少 5 shares
+订单类型：优先 FOK，方便干净评估
+限价：动态 cap
 ```
 
-Important:
+### 动态 cap 梯度
 
-- This is not “pay anything.”
-- Every cap is explicit and logged.
-- Expected value must be evaluated per cap bucket.
+不再只使用 0.65。v2 用信号强度决定可接受价格，以最大化利润和成交率。
 
-### Why adaptive cap?
-
-If Polymarket reprices fast, 0.65 may almost never fill. A strong signal at 0.70 may still be profitable if true win probability is high enough.
-
-Expected value rough logic:
+建议：
 
 ```text
-EV per share = P(win) * 1.00 - entry_price
+弱有效信号：       cap 0.60
+普通信号：         cap 0.65
+强微爆发：         cap 0.70
+非常强的末端走势： cap 0.75
 ```
 
-Examples:
+注意：
+
+- 这不是“无脑高价买”；
+- 每个 cap 都必须明确记录；
+- 每个 cap bucket 单独评估 EV。
+
+### 为什么需要动态 cap？
+
+如果 Polymarket 重新定价很快，0.65 可能很少成交。强信号下 0.70 仍可能有正期望。
+
+粗略 EV：
 
 ```text
-entry 0.65 requires P(win) > 65%
-entry 0.70 requires P(win) > 70%
-entry 0.75 requires P(win) > 75%
+每 share EV = P(win) * 1.00 - entry_price
 ```
 
-v2 should learn which cap bucket is actually profitable.
+例如：
 
----
+```text
+entry 0.65 要求 P(win) > 65%
+entry 0.70 要求 P(win) > 70%
+entry 0.75 要求 P(win) > 75%
+```
 
-## Position management
+v2 要通过数据学习哪个 cap bucket 真正赚钱。
 
-### After fill: hard cooldown
+## 持仓管理
+
+### 成交后硬冷却
 
 ```text
 post_fill_cooldown = 2s
 ```
 
-During cooldown:
+冷却期间：
 
-- no reverse entry;
-- no duplicate entry;
-- no immediate stop;
-- keep recording all CEX trades and Polymarket book changes.
+- 不新开仓；
+- 不反手；
+- 不立即止损；
+- 继续记录所有 CEX trade 和 Polymarket book 变化。
 
-Purpose: avoid getting chopped around the open line.
+目的：避免在 open 附近被噪音来回扫。
 
-### After cooldown: three-way decision
+### 冷却后做三选一
 
-After 2s, do not only ask “stop or hold.” Ask:
-
-```text
-1. Is the trade still aligned?       => hold
-2. Is the signal invalidated?        => stop / reduce
-3. Did price move strongly in favor? => take profit if bid is rich
-```
-
----
-
-## Stop logic
-
-### Stop condition v2-basic
+2 秒后不要只问“止损还是持有”，而是问：
 
 ```text
-UP position:
-    Binance @trade latest price < open - epsilon_stop
-
-DOWN position:
-    Binance @trade latest price > open + epsilon_stop
+1. 信号仍同向？       => hold
+2. 信号已失效？       => stop / reduce
+3. 已大幅盈利？       => take profit
 ```
 
-Suggested:
+## 止损逻辑
+
+### v2 基础止损
+
+```text
+UP 仓：
+    Binance @trade 最新价 < open - epsilon_stop
+
+DOWN 仓：
+    Binance @trade 最新价 > open + epsilon_stop
+```
+
+建议：
 
 ```text
 epsilon_stop >= epsilon_entry
 ```
 
-This avoids stopping on tiny one-tick noise.
+这样避免被很小的噪音止损。
 
-### Stop confirmation options
+### 止损确认实验
 
-Choose one per experiment:
-
-```text
-A. Binance-only fastest stop
-B. Binance + OKX agreement stop
-C. two consecutive reverse @trade prints
-D. reverse microburst volume threshold
-```
-
-v2 default recommendation:
+每个实验可以选择一种：
 
 ```text
-Use B or D for real money, A for latency research.
+A. Binance-only 最快止损
+B. Binance + OKX 同向确认止损
+C. 连续两笔反向 @trade
+D. 反向微爆发成交量达到阈值
 ```
 
----
-
-## Take-profit logic
-
-This is the profit-maximization upgrade.
-
-In Polymarket binary markets, if entry is cheap and target side quickly reprices to high bid, we can lock profit instead of holding to settlement.
-
-After cooldown, if position is still aligned:
+v2 默认建议：
 
 ```text
-if Polymarket bid for held token >= take_profit_bid:
-    sell held shares using FAK/FOK
+实盘小额优先 B 或 D；
+纯延迟研究可以用 A。
 ```
 
-Suggested first thresholds:
+## 止盈逻辑
+
+这是 v2 的利润最大化升级。
+
+如果入场价很便宜，且目标 outcome 很快涨到高 bid，可以提前锁定利润，而不是硬拿到结算。
+
+冷却后，如果仓位仍同向：
+
+```text
+如果 Polymarket 持仓 token bid >= take_profit_bid：
+    卖出已持有 shares
+```
+
+建议阈值：
 
 ```text
 entry <= 0.65 → take profit bid >= 0.85
@@ -348,142 +329,132 @@ entry <= 0.70 → take profit bid >= 0.88
 entry <= 0.75 → take profit bid >= 0.92
 ```
 
-Why:
+原因：
 
-- final seconds can reverse violently;
-- taking +20c/share may be better than risking settlement flip;
-- actual data will tell whether hold-to-expiry or take-profit has higher EV.
+- 最后几秒可能剧烈反转；
+- 每 share 赚 0.20 可能优于冒结算反转风险；
+- 数据会告诉我们 hold-to-expiry 和 take-profit 哪个 EV 更高。
 
----
+## 订单类型
 
-## Order types
+### 入场
 
-### Entry
-
-Prefer:
+优先：
 
 ```text
 FOK BUY 5 shares @ cap
 ```
 
-Reason:
+原因：
 
-- all-or-none;
-- clean ledger;
-- no weird partial minimum-size position.
+- all-or-none；
+- 记账干净；
+- 避免奇怪的 partial minimum-size 仓位。
 
-Optional experiment:
+可选实验：
 
 ```text
 FAK BUY 5 shares @ cap
 ```
 
-Only if partial fill accounting is implemented.
+前提是必须实现 partial fill 记账。
 
-### Exit
+### 出场
 
-Prefer for take-profit:
+止盈可优先：
 
 ```text
 FAK SELL held shares
 ```
 
-because selling some shares at rich bid can de-risk.
+因为能卖多少就卖多少可以降低风险。
 
-For clean first version:
+第一版为了清晰也可以：
 
 ```text
 FOK SELL full held shares
 ```
 
----
+## 防过度交易规则
 
-## Anti-overtrading controls
-
-### Per coin-round max position
+### 每个 coin-round 最多一个活跃仓位
 
 ```text
 max_one_active_position_per_coin_round = true
 ```
 
-### Failed-attempt throttle
+### 失败尝试节流
 
-If entry FOK fails:
-
-```text
-same coin + same direction cooldown = 150ms to 300ms
-```
-
-But do not block opposite direction forever; final-window reversals may matter.
-
-### Chop lockout
-
-If too many crosses occur:
+如果入场 FOK 失败：
 
 ```text
-if cross_count_1s >= 5:
-    lock coin-round for 1s or require very high score
+同 coin + 同 direction 冷却 150ms 到 300ms
 ```
 
-### End-of-round guard
+但不要永久禁止反方向，因为 final window 的反转可能是真实机会。
 
-Avoid initiating new entries too close to settlement unless latency is proven:
+### 震荡锁定
+
+如果穿越太频繁：
 
 ```text
-no new entry if secs_left < 0.35s
+如果 cross_count_1s >= 5：
+    锁定该 coin-round 1 秒，或要求极高 score
 ```
 
-Tune after measuring order roundtrip latency.
+### 回合结束保护
 
----
-
-## Hot-path engineering requirements
-
-The hot path must be extremely small.
-
-### Do in hot path
+如果离结算太近，除非已证明延迟足够低，否则不新开仓：
 
 ```text
-parse Binance trade JSON
-update rolling window
-compute side/score
-if signal: submit prebuilt order intent
+secs_left < 0.35s 时不新开仓
 ```
 
-### Do not do in hot path
+## 热路径工程要求
+
+热路径必须非常轻。
+
+### 热路径应该做
+
+```text
+解析 Binance trade JSON
+更新 rolling window
+计算 side / score
+如果达标：提交预构建 order intent
+```
+
+### 热路径不应该做
 
 ```text
 REST fetch market
 REST fetch book
-heavy JSON logging sync write
-complex strategy loops
-dashboard rendering
-large Python object copying
+同步写大 JSON 日志
+复杂策略循环
+dashboard 渲染
+大量 Python 对象 deepcopy
 ```
 
-### Required architecture
+### 推荐架构
 
 ```text
-CEX WSS thread/task
-    → lock-free or minimal-lock state update
+CEX WSS task
+    → 极少锁或无锁状态更新
     → signal queue
 
 Order executor task
-    → signs/submits immediate order
-    → records response
+    → 签名并提交即时订单
+    → 记录响应
 
 Logger task
-    → async/batched JSONL writes
+    → 异步 / 批量 JSONL 写入
 
 Polymarket WSS task
-    → book cache + diagnostics only
+    → book cache + 诊断，不阻塞下单
 ```
 
----
+## 延迟指标
 
-## Latency metrics
-
-Every attempt must log:
+每次 attempt 必须记录：
 
 ```json
 {
@@ -514,25 +485,22 @@ Every attempt must log:
 }
 ```
 
-Without this, v2 cannot know whether it is losing because of market speed or bot speed.
+没有这些指标，就无法知道是市场太快，还是机器人太慢。
 
----
+## 评估框架
 
-## Evaluation framework
-
-Do not judge v2 only by total PnL at first. First separate the funnel:
+v2 初期不要只看总 PnL，而要拆开漏斗：
 
 ```text
 CEX trade crosses
 → valid microburst signals
 → order attempts
-→ accepted by API
+→ API accepted
 → filled
-→ profitable after fees/spread/slippage
-→ best exit policy
+→ after exit/settlement profitable
 ```
 
-Key metrics:
+关键指标：
 
 ```text
 signals/hour
@@ -543,19 +511,17 @@ EV per filled share
 median trade-to-submit latency
 median submit-to-response latency
 fill rate vs latency bucket
-PnL hold-to-expiry vs take-profit vs stop
+PnL: hold-to-expiry vs take-profit vs stop
 ```
 
----
-
-## Initial v2 parameters
+## 初始 v2 参数
 
 ```text
 primary_source: Binance @trade
 secondary_sources: OKX latest, Bybit latest
 entry_window: final 10s
 no_entry_after: 0.35s left
-entry_epsilon: asset-specific small threshold
+entry_epsilon: 按资产设定
 score_threshold: 1.0 baseline
 entry_caps: [0.60, 0.65, 0.70, 0.75]
 entry_size: 5 shares
@@ -569,42 +535,38 @@ stop_enabled: true
 max_active_position_per_coin_round: 1
 ```
 
----
+## v2 预期优势
 
-## v2 expected advantage
-
-v1 asks:
+v1 问的是：
 
 ```text
-Can 0.65 fills exist after aggTrade cross?
+aggTrade 穿越后，0.65 是否能成交？
 ```
 
-v2 asks a more profitable question:
+v2 问的是更赚钱的问题：
 
 ```text
-At what exact signal strength and price cap does direct immediate execution produce positive EV?
+在什么信号强度和什么价格 cap 下，直接即时执行有正期望？
 ```
 
-This allows the strategy to learn whether the true optimal action is:
+这样策略可以学习真正最优动作：
 
 ```text
-no trade
-0.60 only
-0.65 normal
-0.70 strong
-0.75 very strong
-hold to settlement
-take profit quickly
-stop after confirmation
+不交易
+只做 0.60
+普通做 0.65
+强信号做 0.70
+极强信号做 0.75
+持有到结算
+快速止盈
+确认后止损
 ```
 
----
+## 安全备注
 
-## Safety notes
-
-- No missing response may be counted as a fill.
-- No local orderbook simulation may be counted as real live execution.
-- Every cap bucket must be evaluated separately.
-- If using FAK, partial fill accounting is mandatory.
-- If live trading, start with tiny size and hard daily loss limits.
-- If no actual order/fill exists, dashboard must show empty/cancelled state, not inferred progress.
+- 没有订单响应，不能记为成交；
+- 本地 orderbook 模拟不能记为真实成交；
+- 每个 cap bucket 必须单独评估；
+- 如果使用 FAK，必须支持部分成交记账；
+- 实盘必须从极小 size 和硬性 daily loss limit 开始；
+- 没有真实订单或真实成交时，dashboard 必须显示空状态或取消状态，不显示推断进展。
