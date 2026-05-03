@@ -22,6 +22,8 @@ import math
 import os
 import signal
 import time
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
@@ -168,6 +170,56 @@ class StrategyConfig:
     open_first_after_max_delay_ms: float = 500.0
     open_closest_max_abs_ms: float = 250.0
     log_path: Path = Path("logs/v1_live_trader_events.jsonl")
+    coins: list[str] = field(default_factory=lambda: ["btc"])
+    dashboard_host: str = "0.0.0.0"
+    dashboard_port: int = 30503
+    paper_bankroll: float = 30.0
+    paper_trade_notional: float = 30.0
+
+
+@dataclass
+class PaperPosition:
+    coin: str
+    source: str
+    direction: str
+    token_id: str
+    shares: float
+    avg_price: float
+    cost: float
+    round_start: int
+    opened_at: float
+    meta: dict[str, Any] = field(default_factory=dict)
+    closed: bool = False
+
+
+class PaperLedger:
+    def __init__(self, bankroll: float):
+        self.bankroll = float(bankroll)
+        self.cash = float(bankroll)
+        self.positions: list[PaperPosition] = []
+        self.trades: list[dict[str, Any]] = []
+
+    def record_buy(self, *, coin: str, source: str, direction: str, token_id: str, price: float, max_notional: float, round_start: int, ts: float, meta: dict[str, Any]) -> dict[str, Any]:
+        if price <= 0 or max_notional <= 0 or self.cash <= 0:
+            out = {"paper_status": "rejected", "reason": "invalid_price_or_no_cash"}
+            self.trades.append({"ts": ts, "action": "buy_reject", **out, **meta})
+            return out
+        spend = min(float(max_notional), self.cash)
+        shares = spend / price
+        pos = PaperPosition(coin=coin, source=source, direction=direction, token_id=token_id, shares=shares, avg_price=price, cost=spend, round_start=round_start, opened_at=ts, meta=meta)
+        self.positions.append(pos)
+        self.cash = round(self.cash - spend, 10)
+        out = {"paper_status": "filled", "spent": spend, "shares": shares, "avg_price": price, "cash_after": self.cash}
+        self.trades.append({"ts": ts, "action": "buy", **out, "coin": coin, "source": source, "direction": direction, "round_start": round_start})
+        return out
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "bankroll": self.bankroll,
+            "cash": self.cash,
+            "open_positions": [asdict(p) for p in self.positions if not p.closed],
+            "trades": self.trades[-100:],
+        }
 
 
 @dataclass
@@ -305,7 +357,10 @@ class V1Trader:
         self.cfg = cfg
         self.logger = JsonLogger(cfg.log_path)
         self.executor = PolymarketExecutor(cfg, self.logger)
-        self.state: dict[str, CoinState] = {c: CoinState() for c in COINS}
+        self.coins = [c for c in cfg.coins if c in COIN_MAP]
+        self.state: dict[str, CoinState] = {c: CoinState() for c in self.coins}
+        self.paper = PaperLedger(cfg.paper_bankroll)
+        self.httpd = None
         self.running = True
 
     def fetch_tokens(self, coin: str, round_start: int) -> dict[str, str]:
@@ -437,6 +492,9 @@ class V1Trader:
         st.last_attempt_ts[direction] = now_ts
         token = st.tokens[direction]
         resp = await self.executor.buy(token_id=token, price=self.cfg.entry_price_cap, shares=self.cfg.entry_shares, meta=event)
+        if not self.cfg.live_trading:
+            paper = self.paper.record_buy(coin=coin, source=source, direction=direction, token_id=token, price=self.cfg.entry_price_cap, max_notional=self.cfg.paper_trade_notional, round_start=st.current_round, ts=now_ts, meta=event)
+            self.logger.write({"event": "paper_buy", **event, **paper})
         filled = float(resp.get("filled_shares") or 0.0)
         if filled > 0:
             pos = Position(coin=coin, round_start=st.current_round, direction=direction, token_id=token, shares=filled, avg_price=float(resp.get("avg_fill_price") or self.cfg.entry_price_cap), opened_at=time.time(), cooldown_until=time.time() + self.cfg.post_fill_cooldown_sec, entry_source=source, entry_order_result=resp)
@@ -463,7 +521,7 @@ class V1Trader:
             self.logger.write({"event": "position_stop_attempt", "sold_shares": sold, "response": resp, **meta})
 
     async def binance_loop(self):
-        streams = "/".join([COIN_MAP[c]["binance"] + "@trade" for c in COINS if COIN_MAP[c].get("binance")])
+        streams = "/".join([COIN_MAP[c]["binance"] + "@trade" for c in self.coins if COIN_MAP[c].get("binance")])
         url = "wss://stream.binance.com:9443/stream?streams=" + streams
         while self.running:
             try:
@@ -472,7 +530,7 @@ class V1Trader:
                     async for msg in ws:
                         d = json.loads(msg).get("data", {})
                         sym = d.get("s", "").lower()
-                        coin = next((c for c in COINS if COIN_MAP[c].get("binance") == sym), None)
+                        coin = next((c for c in self.coins if COIN_MAP[c].get("binance") == sym), None)
                         if coin:
                             await self.on_cex_price(coin, "binance_trade", float(d.get("p", 0)), (d.get("T") or d.get("E") or 0) / 1000)
             except Exception as e:
@@ -480,7 +538,7 @@ class V1Trader:
                 await asyncio.sleep(2)
 
     async def coinbase_loop(self):
-        product_ids = [COIN_MAP[c]["coinbase"] for c in COINS if COIN_MAP[c].get("coinbase")]
+        product_ids = [COIN_MAP[c]["coinbase"] for c in self.coins if COIN_MAP[c].get("coinbase")]
         while self.running:
             try:
                 async with websockets.connect("wss://advanced-trade-ws.coinbase.com", ping_interval=20, ping_timeout=10) as ws:
@@ -491,7 +549,7 @@ class V1Trader:
                         for ev in j.get("events", []) or []:
                             for tr in ev.get("trades", []) or []:
                                 pid = tr.get("product_id")
-                                coin = next((c for c in COINS if COIN_MAP[c].get("coinbase") == pid), None)
+                                coin = next((c for c in self.coins if COIN_MAP[c].get("coinbase") == pid), None)
                                 if coin:
                                     # Coinbase messages don't always expose a simple numeric exchange ts in this schema; use receive time.
                                     await self.on_cex_price(coin, "coinbase_market_trades", float(tr.get("price", 0)), time.time())
@@ -500,7 +558,7 @@ class V1Trader:
                 await asyncio.sleep(2)
 
     async def bybit_loop(self):
-        args = ["orderbook.1." + COIN_MAP[c]["bybit"] for c in COINS if COIN_MAP[c].get("bybit")]
+        args = ["orderbook.1." + COIN_MAP[c]["bybit"] for c in self.coins if COIN_MAP[c].get("bybit")]
         while self.running:
             try:
                 async with websockets.connect("wss://stream.bybit.com/v5/public/spot", ping_interval=20, ping_timeout=10) as ws:
@@ -510,7 +568,7 @@ class V1Trader:
                         j = json.loads(msg)
                         topic = j.get("topic", "")
                         sym = topic.split(".")[-1]
-                        coin = next((c for c in COINS if COIN_MAP[c].get("bybit") == sym), None)
+                        coin = next((c for c in self.coins if COIN_MAP[c].get("bybit") == sym), None)
                         data = j.get("data") or {}
                         mid = mid_from_levels(data.get("b") or [], data.get("a") or [])
                         if coin and mid:
@@ -520,7 +578,7 @@ class V1Trader:
                 await asyncio.sleep(2)
 
     async def okx_loop(self):
-        args = [{"channel": "books5", "instId": COIN_MAP[c]["okx"]} for c in COINS if COIN_MAP[c].get("okx")]
+        args = [{"channel": "books5", "instId": COIN_MAP[c]["okx"]} for c in self.coins if COIN_MAP[c].get("okx")]
         while self.running:
             try:
                 async with websockets.connect("wss://ws.okx.com:8443/ws/v5/public", ping_interval=20, ping_timeout=10) as ws:
@@ -530,7 +588,7 @@ class V1Trader:
                         j = json.loads(msg)
                         arg = j.get("arg") or {}
                         inst = arg.get("instId")
-                        coin = next((c for c in COINS if COIN_MAP[c].get("okx") == inst), None)
+                        coin = next((c for c in self.coins if COIN_MAP[c].get("okx") == inst), None)
                         for item in j.get("data", []) or []:
                             mid = mid_from_levels(item.get("bids") or [], item.get("asks") or [])
                             if coin and mid:
@@ -539,10 +597,63 @@ class V1Trader:
                 self.logger.write({"event": "wss_error", "source": "okx_books5_mid", "error": str(e)})
                 await asyncio.sleep(2)
 
+    def dashboard_state(self) -> dict[str, Any]:
+        coins = {}
+        for coin, st in self.state.items():
+            quotes = {}
+            for source, price in st.prices.items():
+                source_open = st.source_opens.get(source)
+                quotes[source] = {
+                    "price": price,
+                    "source_open": source_open,
+                    "delta": None if source_open is None else price - source_open,
+                    "side": st.sides.get(source),
+                    "source_open_status": st.source_open_status.get(source),
+                    "source_open_meta": st.source_open_meta.get(source),
+                }
+            coins[coin] = {
+                "round_start": st.current_round,
+                "round_end": None if st.current_round is None else st.current_round + 900,
+                "secs_left": None if st.current_round is None else round_window()[2],
+                "tokens_ready": bool(st.tokens),
+                "quotes": quotes,
+            }
+        return {
+            "ts": iso_now(),
+            "live_trading": self.cfg.live_trading,
+            "config": {"coins": self.coins, "port": self.cfg.dashboard_port, "paper_bankroll": self.cfg.paper_bankroll, "paper_trade_notional": self.cfg.paper_trade_notional, "entry_window_sec": self.cfg.entry_window_sec},
+            "paper": self.paper.as_dict(),
+            "coins": coins,
+        }
+
+    def start_dashboard(self):
+        if self.httpd is not None:
+            return
+        trader = self
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                return
+            def _send(self, body: bytes, content_type: str):
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            def do_GET(self):
+                if self.path.startswith("/api/state"):
+                    self._send(json.dumps(trader.dashboard_state(), ensure_ascii=False, default=str).encode(), "application/json; charset=utf-8")
+                    return
+                html = """<!doctype html><html><head><meta charset='utf-8'><title>poly v4 30503</title><style>body{font-family:Arial;background:#0b1020;color:#e5e7eb;margin:20px}pre{background:#111827;padding:16px;border-radius:8px;white-space:pre-wrap}.ok{color:#22c55e}</style></head><body><h1>Polymarket v4 BTC 15m Dry-Run</h1><p>Port 30503 / paper bankroll $30 / <span class='ok'>LIVE_TRADING=0</span></p><pre id='s'>loading...</pre><script>async function r(){let j=await fetch('/api/state');let d=await j.json();document.getElementById('s').textContent=JSON.stringify(d,null,2)}setInterval(r,1000);r()</script></body></html>"""
+                self._send(html.encode(), "text/html; charset=utf-8")
+        self.httpd = ThreadingHTTPServer((self.cfg.dashboard_host, self.cfg.dashboard_port), Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.logger.write({"event": "dashboard_started", "host": self.cfg.dashboard_host, "port": self.cfg.dashboard_port})
+
     async def run(self):
         if websockets is None:
             raise RuntimeError("websockets package not installed")
         self.logger.write({"event": "service_started", "live_trading": self.cfg.live_trading, "config": asdict(self.cfg) | {"log_path": str(self.cfg.log_path)}})
+        self.start_dashboard()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -584,6 +695,11 @@ def load_config() -> StrategyConfig:
         open_first_after_max_delay_ms=float(os.getenv("OPEN_FIRST_AFTER_MAX_DELAY_MS", "500")),
         open_closest_max_abs_ms=float(os.getenv("OPEN_CLOSEST_MAX_ABS_MS", "250")),
         log_path=Path(os.getenv("V1_LOG_PATH", "/root/projects/20260503-poly/logs/v1_live_trader_events.jsonl")),
+        coins=[c.strip().lower() for c in os.getenv("COINS", "btc").split(",") if c.strip()],
+        dashboard_host=os.getenv("DASHBOARD_HOST", "0.0.0.0"),
+        dashboard_port=int(os.getenv("DASHBOARD_PORT", "30503")),
+        paper_bankroll=float(os.getenv("PAPER_BANKROLL", "30")),
+        paper_trade_notional=float(os.getenv("PAPER_TRADE_NOTIONAL", "30")),
     )
 
 
