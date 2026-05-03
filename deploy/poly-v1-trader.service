@@ -1,0 +1,19 @@
+[Unit]
+Description=Polymarket V1 fastest CEX open-cross trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/projects/20260503-poly
+EnvironmentFile=/etc/poly-v1-trader.env
+ExecStart=/root/projects/20260503-poly/.venv/bin/python /root/projects/20260503-poly/src/poly_v1_trader.py
+Restart=always
+RestartSec=2
+StandardOutput=append:/root/projects/20260503-poly/logs/v1_trader_stdout.log
+StandardError=append:/root/projects/20260503-poly/logs/v1_trader_stderr.log
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
