@@ -6,6 +6,7 @@ Polymarket 15分钟 UP/DOWN 量化策略研究记录。
 
 ## 版本列表
 
+- [`v3-multi-factor-dynamic-cap-takeprofit`](./v3-multi-factor-dynamic-cap-takeprofit/) — 多因子复合信号 + 动态价格上限 + 分批止盈 + 多币种择优，以利润最大化为目标
 - [`v1.1-clob-sdk-fak-midexit`](./v1.1-clob-sdk-fak-midexit/) — 跳过 orderbook，直接用 py-clob-client SDK 发 FAK 订单，支持中途平仓止损
 - [`v2-trade-lead-profit-maximizer`](./v2-trade-lead-profit-maximizer/) — 全新设计：以 Binance `@trade` 原始成交流为核心领先信号，用微爆发评分、动态价格 cap、直接 FOK/FAK、2 秒冷却、止损/止盈和延迟漏斗日志来最大化利润。
 - [`v1-binance-aggtrade-direct-fok-cooldown-stop`](./v1-binance-aggtrade-direct-fok-cooldown-stop/) — Binance `aggTrade` 穿越 open 后，直接发 Polymarket 受价格保护的 FOK/FAK 订单，成交后 2 秒冷却，再检查止损。
