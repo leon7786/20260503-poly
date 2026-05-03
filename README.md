@@ -6,6 +6,7 @@ This repository records strategy versions, assumptions, execution design, and fu
 
 ## Versions
 
+- [`v2-trade-lead-profit-maximizer`](./v2-trade-lead-profit-maximizer/) — Fresh design: Binance `@trade` microburst lead signal with adaptive protected FOK/FAK entries, 2s cooldown, stop/take-profit management, and latency-funnel logging.
 - [`v1-binance-aggtrade-direct-fok-cooldown-stop`](./v1-binance-aggtrade-direct-fok-cooldown-stop/) — Binance aggTrade open-cross direct FOK/FAK entry with 2s cooldown and post-cooldown stop-loss check.
 
 ## Core principle
