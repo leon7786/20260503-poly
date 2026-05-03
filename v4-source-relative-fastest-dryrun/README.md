@@ -11,7 +11,7 @@ v4 是一个针对 Polymarket 加密货币 15 分钟 **Up/Down** 市场的策略
 核心思路：
 
 1. 根据 slug 自动找到当前 Polymarket 15m 市场 token，例如 `btc-updown-15m-<round_start>`。
-2. 每个报价源在本轮开始时，用自己的第一笔有效价格锁定 `source_open`。
+2. 先确定固定的 15 分钟 round_start 时间戳 `T0`，缓存每个报价源在 `T0` 前后的 tick，再从最接近 `T0` 的合格 tick 锁定 `source_open`。
 3. 最后 10 秒，同时监控多个交易所的最快报价源。
 4. 任意一个 source 穿越自己的 `source_open`，即认为 fastest valid cross 出现。
 5. 立即生成 Polymarket 受保护订单意图，当前默认 dry-run：
@@ -44,13 +44,29 @@ OKX BTC-USDT mid       = 100997.9
 
 如果拿交易所的 absolute price 去穿越 Chainlink open，很容易被交易所 basis 误导。
 
-v4 改用 timestamp 对齐的 source open：
+v4 改用 timestamp 对齐的 source open。具体做法：
 
 ```text
-Binance 当前价  vs Binance 本轮 open
-Coinbase 当前价 vs Coinbase 本轮 open
-Bybit mid 当前价 vs Bybit 本轮 open
-OKX mid 当前价   vs OKX 本轮 open
+T0 = floor(unix_ts / 900) * 900
+```
+
+也就是每个 UTC 15 分钟边界：`00:00`、`00:15`、`00:30`、`00:45`。
+
+服务会缓存每个 source 在 `T0` 前后的 tick，然后按规则选择 source_open：
+
+```text
+优先：first tick at/after T0，且 delay <= OPEN_FIRST_AFTER_MAX_DELAY_MS
+否则：closest tick to T0，且 abs(distance) <= OPEN_CLOSEST_MAX_ABS_MS
+否则：该 source 本轮 source_open_unavailable，不允许它触发 entry
+```
+
+触发时比较的是：
+
+```text
+Binance 当前价  vs Binance 在 T0 附近锁定的 source_open
+Coinbase 当前价 vs Coinbase 在 T0 附近锁定的 source_open
+Bybit mid 当前价 vs Bybit 在 T0 附近锁定的 source_open
+OKX mid 当前价   vs OKX 在 T0 附近锁定的 source_open
 ```
 
 这等价于把每个交易所的开盘价映射到 Polymarket round 的同一个时间戳上。触发信号只看：
@@ -59,7 +75,7 @@ OKX mid 当前价   vs OKX 本轮 open
 source_now 是否穿越 source_open
 ```
 
-这样更接近“用最快交易所报价预测 Chainlink 最终方向”的真实意图。
+这样更接近“用最快交易所报价预测 Chainlink 最终方向”的真实意图，也避免服务中途启动时把第一笔 mid-round tick 错当成本轮开盘价。
 
 ## 3. 当前监控的最快报价源
 
@@ -165,6 +181,10 @@ STOP_ORDER_TYPE=FAK
 ENTRY_EPSILON_PCT=0
 DRY_RUN_FILL_MODE=no_fill
 SOURCE_OPEN_MAX_DELAY_SEC=5
+OPEN_LOCK_LOOKBACK_SEC=3
+OPEN_LOCK_AFTER_SEC=0.5
+OPEN_FIRST_AFTER_MAX_DELAY_MS=500
+OPEN_CLOSEST_MAX_ABS_MS=250
 V1_LOG_PATH=/root/projects/20260503-poly/logs/v1_live_trader_events.jsonl
 POLY_TICK_SIZE=0.01
 POLY_NEG_RISK=0
@@ -183,6 +203,10 @@ POLY_NEG_RISK=0
 | `FAILED_ATTEMPT_COOLDOWN_SEC=0.2` | 失败尝试冷却，避免 tick 级别刷单 |
 | `DRY_RUN_FILL_MODE=no_fill` | dry-run 默认不假设成交 |
 | `SOURCE_OPEN_MAX_DELAY_SEC=5` | source open 迟到超过 5 秒则不使用该 source entry |
+| `OPEN_LOCK_LOOKBACK_SEC=3` | 缓存 T0 前 3 秒 tick，用于 closest fallback |
+| `OPEN_LOCK_AFTER_SEC=0.5` | T0 后等待 0.5 秒再锁 open，给高速 feed 留出 after tick |
+| `OPEN_FIRST_AFTER_MAX_DELAY_MS=500` | first tick at/after T0 最多允许晚 500ms |
+| `OPEN_CLOSEST_MAX_ABS_MS=250` | closest tick 距离 T0 最多允许 ±250ms |
 
 ## 7. 安装
 
@@ -261,7 +285,11 @@ tail -n 100 logs/v1_live_trader_events.jsonl
   "source": "bybit_orderbook1_mid",
   "round_start": 1777834800,
   "source_open": 123456.7,
-  "open_delay_ms": 42.0
+  "open_method": "first_tick_after",
+  "tick_exchange_ts": 1777834800.012,
+  "tick_receive_ts": 1777834800.021,
+  "open_delay_ms": 12.0,
+  "distance_ms": 12.0
 }
 ```
 
@@ -350,14 +378,15 @@ cross
 ## 13. 重要限制
 
 - dry-run 默认 `DRY_RUN_FILL_MODE=no_fill`，只验证信号和下单意图，不代表真实成交质量。
-- `open_price` 目前是 audit/fallback 字段；实际触发使用的是每个 source 自己的 `source_open`。
+- `open_price` 目前是 audit/fallback 字段；实际触发使用的是每个 source 在固定 T0 附近锁定的 `source_open`。
+- 如果服务中途启动，无法在 T0 附近找到合格 tick，该 source 本轮会标记 `source_open_unavailable`，不会触发 entry。
 - Chainlink official open/close 后续仍应接入日志，用于复盘哪个 source 更贴近最终结算。
 - live trading 需要确认钱包、funder、signature_type、余额、allowance 和地理/合规限制。
 - final 10s aggressive 策略可能高频触发，必须依赖 cooldown 和 order cap 防止过度交易。
 
 ## 14. v4 相比旧版本新增内容
 
-- timestamp/source-relative open 锁定；
+- 固定 T0 round_start + tick buffer source_open 锁定；
 - 多交易所 fastest quote monitoring；
 - Coinbase `market_trades`；
 - Binance `@trade`；

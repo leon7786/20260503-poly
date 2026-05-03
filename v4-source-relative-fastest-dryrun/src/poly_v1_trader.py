@@ -2,8 +2,10 @@
 """Polymarket v1 live/dry-run trader.
 
 V1 aggressive source-relative strategy:
-- Lock each exchange/source's own 15m round-open price by timestamp.
-- In final 10s, fastest quote source crossing its own source_open triggers entry.
+- Determine the fixed 15m round boundary T0 first.
+- Buffer quote ticks around T0 and lock each source_open from the tick nearest to T0,
+  preferring the first tick at/after T0 within a tight delay.
+- In final 10s, fastest quote source crossing its locked source_open triggers entry.
 - Sources: Binance @trade, Coinbase market_trades, Bybit orderbook.1 mid, OKX books5 mid.
 - Immediately submit protected Polymarket BUY 5 shares @ 0.65, OrderType FAK/FOK.
 
@@ -99,6 +101,53 @@ def mid_from_levels(bids: list[Any], asks: list[Any]) -> Optional[float]:
 
 
 @dataclass
+class SourceTick:
+    price: float
+    exchange_ts: float
+    receive_ts: float
+
+
+@dataclass
+class SelectedOpenTick:
+    price: float
+    exchange_ts: float
+    receive_ts: float
+    method: str
+    delay_ms: float
+    distance_ms: float
+
+
+def select_open_tick(
+    ticks: list[SourceTick],
+    round_start: float,
+    *,
+    first_after_max_delay_ms: float,
+    closest_max_abs_ms: float,
+) -> Optional[SelectedOpenTick]:
+    """Select source_open from ticks around fixed T0.
+
+    Priority:
+    1. First tick with exchange_ts >= T0 and delay <= first_after_max_delay_ms.
+    2. Closest tick to T0 if abs(distance) <= closest_max_abs_ms.
+    3. None.
+    """
+    valid = [t for t in ticks if t.price > 0 and math.isfinite(t.price) and t.exchange_ts > 0]
+    if not valid:
+        return None
+    after = sorted((t for t in valid if t.exchange_ts >= round_start), key=lambda t: t.exchange_ts)
+    if after:
+        t = after[0]
+        delay_ms = (t.exchange_ts - round_start) * 1000.0
+        if delay_ms <= first_after_max_delay_ms:
+            return SelectedOpenTick(t.price, t.exchange_ts, t.receive_ts, "first_tick_after", delay_ms, delay_ms)
+    t = min(valid, key=lambda x: abs(x.exchange_ts - round_start))
+    distance_ms = (t.exchange_ts - round_start) * 1000.0
+    if abs(distance_ms) <= closest_max_abs_ms:
+        return SelectedOpenTick(t.price, t.exchange_ts, t.receive_ts, "closest_tick", max(0.0, distance_ms), distance_ms)
+    return None
+
+
+@dataclass
 class StrategyConfig:
     live_trading: bool = False
     entry_window_sec: float = 10.0
@@ -114,6 +163,10 @@ class StrategyConfig:
     epsilon_pct: float = 0.0
     dry_run_fill_mode: str = "no_fill"  # no_fill | pretend_full
     source_open_max_delay_sec: float = 5.0
+    open_lock_lookback_sec: float = 3.0
+    open_lock_after_sec: float = 0.5
+    open_first_after_max_delay_ms: float = 500.0
+    open_closest_max_abs_ms: float = 250.0
     log_path: Path = Path("logs/v1_live_trader_events.jsonl")
 
 
@@ -140,6 +193,9 @@ class CoinState:
     sides: dict[str, str] = field(default_factory=dict)
     source_opens: dict[str, float] = field(default_factory=dict)
     open_delays_ms: dict[str, float] = field(default_factory=dict)
+    source_open_status: dict[str, str] = field(default_factory=dict)  # pending|locked|unavailable
+    source_open_meta: dict[str, dict[str, Any]] = field(default_factory=dict)
+    tick_buffers: dict[str, list[SourceTick]] = field(default_factory=dict)
     tokens: dict[str, str] = field(default_factory=dict)  # UP/DOWN -> token_id
     active_position: Optional[Position] = None
     last_attempt_ts: dict[str, float] = field(default_factory=dict)
@@ -275,6 +331,9 @@ class V1Trader:
             st.sides.clear()
             st.source_opens.clear()
             st.open_delays_ms.clear()
+            st.source_open_status.clear()
+            st.source_open_meta.clear()
+            st.tick_buffers.clear()
             st.tokens.clear()
             st.active_position = None
             st.last_attempt_ts.clear()
@@ -290,15 +349,38 @@ class V1Trader:
                 self.logger.write({"event": "token_fetch_error", "coin": coin, "round_start": st.current_round, "error": str(e)})
             self.logger.write({"event": "open_set", "coin": coin, "round_start": st.current_round, "open": price, "tokens_ready": bool(st.tokens), "open_source": "first_source_tick_audit"})
 
-    def lock_source_open_if_needed(self, coin: str, source: str, price: float, now_ts: float) -> bool:
+    def buffer_source_tick(self, coin: str, source: str, price: float, exchange_ts: float, receive_ts: float):
+        st = self.state[coin]
+        buf = st.tick_buffers.setdefault(source, [])
+        buf.append(SourceTick(price=price, exchange_ts=exchange_ts or receive_ts, receive_ts=receive_ts))
+        round_start = st.current_round if st.current_round is not None else round_window(receive_ts)[0]
+        min_ts = round_start - self.cfg.open_lock_lookback_sec
+        max_ts = round_start + max(self.cfg.open_lock_after_sec, self.cfg.open_first_after_max_delay_ms / 1000.0, self.cfg.open_closest_max_abs_ms / 1000.0) + 2.0
+        st.tick_buffers[source] = [t for t in buf if min_ts <= t.exchange_ts <= max_ts]
+
+    def maybe_lock_source_open(self, coin: str, source: str, now_ts: float) -> bool:
         st = self.state[coin]
         if source in st.source_opens:
             return False
         round_start = st.current_round if st.current_round is not None else round_window(now_ts)[0]
-        delay_ms = max(0.0, (now_ts - round_start) * 1000.0)
-        st.source_opens[source] = price
-        st.open_delays_ms[source] = delay_ms
-        self.logger.write({"event": "source_open_locked", "coin": coin, "source": source, "round_start": round_start, "source_open": price, "open_delay_ms": delay_ms})
+        if now_ts < round_start + self.cfg.open_lock_after_sec:
+            st.source_open_status.setdefault(source, "pending")
+            return False
+        selected = select_open_tick(
+            st.tick_buffers.get(source, []),
+            float(round_start),
+            first_after_max_delay_ms=self.cfg.open_first_after_max_delay_ms,
+            closest_max_abs_ms=self.cfg.open_closest_max_abs_ms,
+        )
+        if selected is None:
+            st.source_open_status[source] = "unavailable"
+            self.logger.write({"event": "source_open_unavailable", "coin": coin, "source": source, "round_start": round_start, "reason": "no_tick_within_tolerance"})
+            return False
+        st.source_opens[source] = selected.price
+        st.open_delays_ms[source] = selected.delay_ms
+        st.source_open_status[source] = "locked"
+        st.source_open_meta[source] = asdict(selected)
+        self.logger.write({"event": "source_open_locked", "coin": coin, "source": source, "round_start": round_start, "source_open": selected.price, "open_method": selected.method, "tick_exchange_ts": selected.exchange_ts, "tick_receive_ts": selected.receive_ts, "open_delay_ms": selected.delay_ms, "distance_ms": selected.distance_ms})
         return True
 
     def should_attempt_entry(self, coin: str, source: str, direction: str, now_ts: float) -> tuple[bool, str]:
@@ -307,8 +389,8 @@ class V1Trader:
             return False, "flat_direction"
         if not st.tokens.get(direction):
             return False, "no_token"
-        if source not in st.source_opens:
-            return False, "no_source_open"
+        if source not in st.source_opens or st.source_open_status.get(source) != "locked":
+            return False, "no_locked_source_open"
         if st.open_delays_ms.get(source, 0.0) > self.cfg.source_open_max_delay_sec * 1000:
             return False, "source_open_too_late"
         _, _, secs_left = round_window(now_ts)
@@ -331,15 +413,16 @@ class V1Trader:
         now_ts = time.time()
         self.reset_round_if_needed(coin, now_ts)
         self.update_open(coin, price)
-        locked = self.lock_source_open_if_needed(coin, source, price, now_ts)
+        self.buffer_source_tick(coin, source, price, exchange_ts or now_ts, now_ts)
+        locked_now = self.maybe_lock_source_open(coin, source, now_ts)
         st = self.state[coin]
-        source_open = st.source_opens[source]
+        source_open = st.source_opens.get(source)
         prev_side = st.sides.get(source)
-        cur_side = side_vs_open(price, source_open, self.cfg.epsilon_pct)
+        cur_side = side_vs_open(price, source_open, self.cfg.epsilon_pct) if source_open is not None else "FLAT"
         st.prices[source] = price
         st.sides[source] = cur_side
-        self.logger.write({"event": "source_tick", "coin": coin, "source": source, "price": price, "source_open": source_open, "side": cur_side, "round_start": st.current_round, "exchange_ts": exchange_ts, "receive_ts": now_ts})
-        if not locked and prev_side and cur_side != prev_side and cur_side in ("UP", "DOWN") and prev_side != "FLAT":
+        self.logger.write({"event": "source_tick", "coin": coin, "source": source, "price": price, "source_open": source_open, "source_open_status": st.source_open_status.get(source), "side": cur_side, "round_start": st.current_round, "exchange_ts": exchange_ts, "receive_ts": now_ts})
+        if not locked_now and source_open is not None and prev_side and cur_side != prev_side and cur_side in ("UP", "DOWN") and prev_side != "FLAT":
             await self.handle_cross(coin, source, cur_side, price, exchange_ts, now_ts, prev_side)
         await self.check_stop(coin, source, price, cur_side, now_ts)
 
@@ -347,7 +430,7 @@ class V1Trader:
         ok, reason = self.should_attempt_entry(coin, source, direction, now_ts)
         st = self.state[coin]
         source_open = st.source_opens.get(source)
-        event = {"coin": coin, "source": source, "direction": direction, "prev_side": prev_side, "price": price, "open": st.open_price, "source_open": source_open, "source_delta": None if source_open is None else price - source_open, "round_start": st.current_round, "exchange_ts": exchange_ts, "receive_ts": now_ts, "secs_left": round_window(now_ts)[2], "reason": reason}
+        event = {"coin": coin, "source": source, "direction": direction, "prev_side": prev_side, "price": price, "open": st.open_price, "source_open": source_open, "source_open_meta": st.source_open_meta.get(source), "source_delta": None if source_open is None else price - source_open, "round_start": st.current_round, "exchange_ts": exchange_ts, "receive_ts": now_ts, "secs_left": round_window(now_ts)[2], "reason": reason}
         self.logger.write({"event": "cross", **event})
         if not ok:
             return
@@ -372,7 +455,7 @@ class V1Trader:
             return
         if cur_side == "FLAT" or cur_side == pos.direction:
             return
-        meta = {"coin": coin, "source": source, "round_start": st.current_round, "position_direction": pos.direction, "reverse_side": cur_side, "price": price, "source_open": st.source_opens.get(source), "open": st.open_price, "shares": pos.shares}
+        meta = {"coin": coin, "source": source, "round_start": st.current_round, "position_direction": pos.direction, "reverse_side": cur_side, "price": price, "source_open": st.source_opens.get(source), "source_open_meta": st.source_open_meta.get(source), "open": st.open_price, "shares": pos.shares}
         resp = await self.executor.sell(token_id=pos.token_id, price=self.cfg.stop_sell_floor, shares=pos.shares, meta=meta)
         sold = float(resp.get("filled_shares") or 0.0)
         if sold > 0 or self.cfg.live_trading:
@@ -410,6 +493,7 @@ class V1Trader:
                                 pid = tr.get("product_id")
                                 coin = next((c for c in COINS if COIN_MAP[c].get("coinbase") == pid), None)
                                 if coin:
+                                    # Coinbase messages don't always expose a simple numeric exchange ts in this schema; use receive time.
                                     await self.on_cex_price(coin, "coinbase_market_trades", float(tr.get("price", 0)), time.time())
             except Exception as e:
                 self.logger.write({"event": "wss_error", "source": "coinbase_market_trades", "error": str(e)})
@@ -495,6 +579,10 @@ def load_config() -> StrategyConfig:
         epsilon_pct=float(os.getenv("ENTRY_EPSILON_PCT", "0")),
         dry_run_fill_mode=os.getenv("DRY_RUN_FILL_MODE", "no_fill"),
         source_open_max_delay_sec=float(os.getenv("SOURCE_OPEN_MAX_DELAY_SEC", "5")),
+        open_lock_lookback_sec=float(os.getenv("OPEN_LOCK_LOOKBACK_SEC", "3")),
+        open_lock_after_sec=float(os.getenv("OPEN_LOCK_AFTER_SEC", "0.5")),
+        open_first_after_max_delay_ms=float(os.getenv("OPEN_FIRST_AFTER_MAX_DELAY_MS", "500")),
+        open_closest_max_abs_ms=float(os.getenv("OPEN_CLOSEST_MAX_ABS_MS", "250")),
         log_path=Path(os.getenv("V1_LOG_PATH", "/root/projects/20260503-poly/logs/v1_live_trader_events.jsonl")),
     )
 

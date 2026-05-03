@@ -44,6 +44,8 @@ def setup_coin(m, t, coin="btc", now=1000.0):
     st.current_round = start
     st.open_price = 100.0
     st.source_opens = {"binance_trade": 100.0}
+    st.open_delays_ms = {"binance_trade": 0.0}
+    st.source_open_status = {"binance_trade": "locked"}
     st.tokens = {"UP": "up-token", "DOWN": "down-token"}
     return st
 
@@ -100,6 +102,8 @@ def test_source_relative_open_cross_triggers_even_if_polymarket_open_differs(tmp
     st = setup_coin(m, t, now=2692.0)
     st.open_price = 1000.0  # audit-only/Polymarket open can differ materially
     st.source_opens = {"coinbase_market_trades": 995.0}
+    st.open_delays_ms = {"coinbase_market_trades": 12.0}
+    st.source_open_status = {"coinbase_market_trades": "locked"}
     st.sides = {"coinbase_market_trades": "DOWN"}
     monkeypatch.setattr(m.time, "time", lambda: 2692.0)
     asyncio.run(t.on_cex_price("btc", "coinbase_market_trades", 996.0, 2692.0))
@@ -108,16 +112,51 @@ def test_source_relative_open_cross_triggers_even_if_polymarket_open_differs(tmp
     assert t.executor.buys[0][3]["open"] == 1000.0
 
 
-def test_first_tick_after_round_locks_source_open_without_trigger(tmp_path, monkeypatch):
+def test_first_tick_in_mid_round_buffers_but_does_not_lock_source_open(tmp_path, monkeypatch):
     m, t = make_trader(tmp_path, filled=0.0)
     st = setup_coin(m, t, now=2692.0)
     st.source_opens = {}
+    st.open_delays_ms = {}
+    st.source_open_status = {}
     st.sides = {}
     monkeypatch.setattr(m.time, "time", lambda: 2692.0)
     asyncio.run(t.on_cex_price("btc", "bybit_orderbook1_mid", 123.4, 2692.0))
-    assert st.source_opens["bybit_orderbook1_mid"] == 123.4
-    assert st.open_delays_ms["bybit_orderbook1_mid"] == 892000.0
+    assert "bybit_orderbook1_mid" not in st.source_opens
+    assert st.source_open_status["bybit_orderbook1_mid"] == "unavailable"
     assert t.executor.buys == []
+
+
+def test_select_open_tick_prefers_first_tick_after_round_start():
+    m = load_mod()
+    ticks = [
+        m.SourceTick(price=99.0, exchange_ts=999.8, receive_ts=999.81),
+        m.SourceTick(price=100.0, exchange_ts=1000.012, receive_ts=1000.02),
+        m.SourceTick(price=101.0, exchange_ts=1000.2, receive_ts=1000.21),
+    ]
+    selected = m.select_open_tick(ticks, 1000.0, first_after_max_delay_ms=500, closest_max_abs_ms=250)
+    assert selected is not None
+    assert selected.price == 100.0
+    assert selected.method == "first_tick_after"
+    assert round(selected.delay_ms, 1) == 12.0
+
+
+def test_select_open_tick_uses_closest_fallback_when_first_after_too_late():
+    m = load_mod()
+    ticks = [
+        m.SourceTick(price=99.5, exchange_ts=999.9, receive_ts=999.91),
+        m.SourceTick(price=100.5, exchange_ts=1000.8, receive_ts=1000.81),
+    ]
+    selected = m.select_open_tick(ticks, 1000.0, first_after_max_delay_ms=500, closest_max_abs_ms=250)
+    assert selected is not None
+    assert selected.price == 99.5
+    assert selected.method == "closest_tick"
+    assert round(selected.distance_ms, 1) == -100.0
+
+
+def test_select_open_tick_returns_none_when_no_tick_near_boundary():
+    m = load_mod()
+    ticks = [m.SourceTick(price=99.0, exchange_ts=998.0, receive_ts=998.01), m.SourceTick(price=101.0, exchange_ts=1001.0, receive_ts=1001.01)]
+    assert m.select_open_tick(ticks, 1000.0, first_after_max_delay_ms=500, closest_max_abs_ms=250) is None
 
 
 def test_parse_bybit_orderbook_mid_and_okx_books5_mid():
